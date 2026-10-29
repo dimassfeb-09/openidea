@@ -15,9 +15,12 @@ use sqlx::{
     postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgSslMode},
     sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions},
 };
+use bb8::Pool as Bb8Pool;
+use bb8_tiberius::ConnectionManager as MssqlConnectionManager;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use futures::StreamExt;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
@@ -48,18 +51,10 @@ pub enum Pool {
     Sqlite(SqlitePool),
     Postgres(PgPool),
     Mysql(MySqlPool),
+    SqlServer(Bb8Pool<MssqlConnectionManager>),
 }
 
-/// Runs `$body` with `$p` bound to the concrete pool of each driver.
-macro_rules! with_pool {
-    ($pool:expr, $p:ident => $body:expr) => {
-        match $pool {
-            Pool::Sqlite($p) => $body,
-            Pool::Postgres($p) => $body,
-            Pool::Mysql($p) => $body,
-        }
-    };
-}
+
 
 pub(crate) fn db_err(e: sqlx::Error) -> IdeError {
     match &e {
@@ -77,6 +72,36 @@ pub(crate) fn db_err(e: sqlx::Error) -> IdeError {
         sqlx::Error::Io(_) | sqlx::Error::Tls(_) => IdeError::new(ErrorKind::Io, e.to_string()),
         _ => IdeError::new(ErrorKind::Protocol, e.to_string()),
     }
+}
+
+fn tiberius_cell(row: &tiberius::Row, i: usize) -> Option<String> {
+    if let Ok(Some(v)) = row.try_get::<&str, usize>(i) {
+        return Some(v.to_owned());
+    }
+
+    if let Ok(Some(v)) = row.try_get::<i64, usize>(i) {
+        return Some(v.to_string());
+    }
+    if let Ok(Some(v)) = row.try_get::<i32, usize>(i) {
+        return Some(v.to_string());
+    }
+    if let Ok(Some(v)) = row.try_get::<i16, usize>(i) {
+        return Some(v.to_string());
+    }
+    if let Ok(Some(v)) = row.try_get::<f64, usize>(i) {
+        return Some(v.to_string());
+    }
+    if let Ok(Some(v)) = row.try_get::<f32, usize>(i) {
+        return Some(v.to_string());
+    }
+    if let Ok(Some(v)) = row.try_get::<bool, usize>(i) {
+        return Some(v.to_string());
+    }
+    if let Ok(Some(v)) = row.try_get::<&[u8], usize>(i) {
+        return Some(hex(v));
+    }
+    // Null or unsupported type.
+    None
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -313,6 +338,7 @@ impl Pool {
             Pool::Sqlite(_) => DbDriver::Sqlite,
             Pool::Postgres(_) => DbDriver::Postgres,
             Pool::Mysql(_) => DbDriver::Mysql,
+            Pool::SqlServer(_) => DbDriver::SqlServer,
         }
     }
 
@@ -453,21 +479,96 @@ impl Pool {
                     .map_err(db_err)?;
                 Ok(Pool::Mysql(pool))
             }
+            DbDriver::SqlServer => {
+                use tiberius::Config;
+                let mut config = Config::new();
+                config.host(&source.host);
+                config.port(source.port.unwrap_or(1433));
+                if !source.user.is_empty() {
+                    config.authentication(tiberius::AuthMethod::sql_server(
+                        source.user.clone(),
+                        password.unwrap_or_default().to_owned(),
+                    ));
+                }
+                if !source.database.is_empty() {
+                    config.database(&source.database);
+                }
+                if matches!(source.ssl, DbSslMode::Disable | DbSslMode::Prefer) {
+                    config.trust_cert();
+                }
+                let manager = MssqlConnectionManager::new(config);
+                let pool = bb8::Pool::builder()
+                    .max_size(MAX)
+                    .connection_timeout(timeout)
+                    .build(manager)
+                    .await
+                    .map_err(|e| IdeError::new(ErrorKind::Io, e.to_string()))?;
+                let mut conn = pool
+                    .get_owned()
+                    .await
+                    .map_err(|e| IdeError::new(ErrorKind::Io, e.to_string()))?;
+                let _ = conn.query("SELECT 1", &[]).await;
+                Ok(Pool::SqlServer(pool))
+            }
         }
     }
 
     pub async fn close(&self) {
-        with_pool!(self, p => p.close().await)
+        match self {
+            Pool::Sqlite(p) => p.close().await,
+            Pool::Postgres(p) => p.close().await,
+            Pool::Mysql(p) => p.close().await,
+            Pool::SqlServer(_) => {}
+        }
     }
 
     pub fn is_closed(&self) -> bool {
-        with_pool!(self, p => p.is_closed())
+        match self {
+            Pool::Sqlite(p) => p.is_closed(),
+            Pool::Postgres(p) => p.is_closed(),
+            Pool::Mysql(p) => p.is_closed(),
+            Pool::SqlServer(_) => false,
+        }
     }
 
     /// Runs `sql` (no row limit beyond `max`), for introspection: cells are text (see [`Cells::Text`]).
     pub async fn rows(&self, sql: &str, max: usize) -> IdeResult<Vec<Vec<Option<String>>>> {
-        let fetched: IdeResult<Fetched> = with_pool!(self, p => fetch!(p, sql, max, Cells::Text));
-        Ok(fetched?.1)
+        match self {
+            Pool::SqlServer(p) => {
+                let mut conn = p.get_owned().await.map_err(|e| IdeError::new(ErrorKind::Io, e.to_string()))?;
+                let mut stream = conn.query(sql, &[]).await.map_err(|e| IdeError::new(ErrorKind::Protocol, e.to_string()))?;
+                let mut rows = Vec::new();
+                let mut has_more = false;
+                while let Some(res) = stream.next().await {
+                    let item = res.map_err(|e| IdeError::new(ErrorKind::Protocol, e.to_string()))?;
+                    if let tiberius::QueryItem::Row(row) = item {
+                        if rows.len() >= max {
+                            has_more = true;
+                            break;
+                        }
+                        let mut cells = Vec::with_capacity(row.len());
+                        for i in 0..row.len() {
+                            cells.push(tiberius_cell(&row, i));
+                        }
+                        rows.push(cells);
+                    }
+                }
+                let _ = has_more;
+                Ok(rows)
+            }
+            Pool::Sqlite(p) => {
+                let fetched: IdeResult<Fetched> = fetch!(p, sql, max, Cells::Text);
+                Ok(fetched?.1)
+            }
+            Pool::Postgres(p) => {
+                let fetched: IdeResult<Fetched> = fetch!(p, sql, max, Cells::Text);
+                Ok(fetched?.1)
+            }
+            Pool::Mysql(p) => {
+                let fetched: IdeResult<Fetched> = fetch!(p, sql, max, Cells::Text);
+                Ok(fetched?.1)
+            }
+        }
     }
 
     /// Runs one statement and keeps at most `max_rows` rows. Cancelling stops
@@ -485,21 +586,67 @@ impl Pool {
     /// Runs `statements` in one transaction; each must change `expect_one`
     /// row when flagged (table editor submits).
     pub async fn transaction(&self, statements: &[(String, bool)]) -> IdeResult<u64> {
-        with_pool!(self, p => {
-            let mut tx = p.begin().await.map_err(db_err)?;
-            let mut total = 0;
-            for (sql, expect_one) in statements {
-                let done = sqlx::raw_sql(sqlx::AssertSqlSafe(sql.clone())).execute(&mut *tx).await.map_err(db_err)?;
-                let n = done.rows_affected();
-                // MySQL reports 0 for an UPDATE that leaves the row unchanged.
-                if *expect_one && (n > 1 || (n == 0 && !matches!(self, Pool::Mysql(_)))) {
-                    return Err(IdeError::invalid(format!("{sql}: expected to change 1 row, changed {n}; nothing was saved")));
+        match self {
+            Pool::SqlServer(p) => {
+                let mut conn = p.get_owned().await.map_err(|e| IdeError::new(ErrorKind::Io, e.to_string()))?;
+                conn.execute("BEGIN TRAN", &[]).await.map_err(|e| IdeError::new(ErrorKind::Protocol, e.to_string()))?;
+                let mut total = 0u64;
+                for (sql, expect_one) in statements {
+                    let res = conn.execute(sql, &[]).await.map_err(|e| IdeError::new(ErrorKind::Protocol, e.to_string()))?;
+                    let n = res.rows_affected().iter().sum::<u64>();
+                    if *expect_one && (n > 1 || n == 0) {
+                        let _ = conn.execute("ROLLBACK TRAN", &[]).await;
+                        return Err(IdeError::invalid(format!("{sql}: expected to change 1 row, changed {n}; nothing was saved")));
+                    }
+                    total += n;
                 }
-                total += n;
+                conn.execute("COMMIT TRAN", &[]).await.map_err(|e| IdeError::new(ErrorKind::Protocol, e.to_string()))?;
+                Ok(total)
             }
-            tx.commit().await.map_err(db_err)?;
-            Ok(total)
-        })
+            Pool::Sqlite(p) => {
+                let mut tx = p.begin().await.map_err(db_err)?;
+                let mut total = 0;
+                for (sql, expect_one) in statements {
+                    let done = sqlx::raw_sql(sqlx::AssertSqlSafe(sql.clone())).execute(&mut *tx).await.map_err(db_err)?;
+                    let n = done.rows_affected();
+                    if *expect_one && (n > 1 || (n == 0 && true)) {
+                        return Err(IdeError::invalid(format!("{sql}: expected to change 1 row, changed {n}; nothing was saved")));
+                    }
+                    total += n;
+                }
+                tx.commit().await.map_err(db_err)?;
+                Ok(total)
+            }
+            Pool::Postgres(p) => {
+                let mut tx = p.begin().await.map_err(db_err)?;
+                let mut total = 0;
+                for (sql, expect_one) in statements {
+                    let done = sqlx::raw_sql(sqlx::AssertSqlSafe(sql.clone())).execute(&mut *tx).await.map_err(db_err)?;
+                    let n = done.rows_affected();
+                    if *expect_one && (n > 1 || (n == 0 && true)) {
+                        return Err(IdeError::invalid(format!("{sql}: expected to change 1 row, changed {n}; nothing was saved")));
+                    }
+                    total += n;
+                }
+                tx.commit().await.map_err(db_err)?;
+                Ok(total)
+            }
+            Pool::Mysql(p) => {
+                let mut tx = p.begin().await.map_err(db_err)?;
+                let mut total = 0;
+                for (sql, expect_one) in statements {
+                    let done = sqlx::raw_sql(sqlx::AssertSqlSafe(sql.clone())).execute(&mut *tx).await.map_err(db_err)?;
+                    let n = done.rows_affected();
+                    // MySQL reports 0 for an UPDATE that leaves the row unchanged.
+                    if *expect_one && (n > 1 || (n == 0 && false)) {
+                        return Err(IdeError::invalid(format!("{sql}: expected to change 1 row, changed {n}; nothing was saved")));
+                    }
+                    total += n;
+                }
+                tx.commit().await.map_err(db_err)?;
+                Ok(total)
+            }
+        }
     }
 }
 
@@ -509,6 +656,7 @@ pub enum Held {
     Sqlite(PoolConnection<Sqlite>),
     Postgres(PoolConnection<Postgres>),
     Mysql(PoolConnection<MySql>),
+    SqlServer(bb8::PooledConnection<'static, MssqlConnectionManager>),
 }
 
 impl Held {
@@ -517,18 +665,29 @@ impl Held {
             Pool::Sqlite(p) => Held::Sqlite(p.acquire().await.map_err(db_err)?),
             Pool::Postgres(p) => Held::Postgres(p.acquire().await.map_err(db_err)?),
             Pool::Mysql(p) => Held::Mysql(p.acquire().await.map_err(db_err)?),
+            Pool::SqlServer(p) => Held::SqlServer(p.get_owned().await.map_err(|e| IdeError::new(ErrorKind::Io, e.to_string()))?),
         })
     }
 
     /// Runs a statement without results (`BEGIN`, `COMMIT`, `ROLLBACK`).
     pub async fn command(&mut self, sql: &str) -> IdeResult<()> {
-        let sql = sqlx::AssertSqlSafe(sql.to_owned());
         match self {
-            Held::Sqlite(c) => sqlx::raw_sql(sql).execute(&mut **c).await.map(drop),
-            Held::Postgres(c) => sqlx::raw_sql(sql).execute(&mut **c).await.map(drop),
-            Held::Mysql(c) => sqlx::raw_sql(sql).execute(&mut **c).await.map(drop),
+            Held::SqlServer(c) => c
+                .execute(sql, &[])
+                .await
+                .map(|_| ())
+                .map_err(|e| IdeError::new(ErrorKind::Protocol, e.to_string())),
+            other => {
+                let sql = sqlx::AssertSqlSafe(sql.to_owned());
+                match other {
+                    Held::Sqlite(c) => sqlx::raw_sql(sql).execute(&mut **c).await.map(drop),
+                    Held::Postgres(c) => sqlx::raw_sql(sql).execute(&mut **c).await.map(drop),
+                    Held::Mysql(c) => sqlx::raw_sql(sql).execute(&mut **c).await.map(drop),
+                    Held::SqlServer(_) => unreachable!(),
+                }
+                .map_err(db_err)
+            }
         }
-        .map_err(db_err)
     }
 
     /// Closes the connection instead of returning it to the pool (its statement was
@@ -542,6 +701,7 @@ impl Held {
             Held::Mysql(c) => {
                 let _ = c.detach().close().await;
             }
+            Held::SqlServer(_) => {}
         }
     }
 
@@ -589,6 +749,38 @@ impl Held {
                 run!(c, Some("SELECT pg_backend_pid()"), |b: String| format!("SELECT pg_cancel_backend({b})"))
             }
             Held::Mysql(c) => run!(c, Some("SELECT CONNECTION_ID()"), |b: String| format!("KILL QUERY {b}")),
+            Held::SqlServer(c) => {
+                // Basic execution without cancellation-on-server; dropping the stream aborts client-side.
+                let mut stream = c.query(sql, &[]).await.map_err(|e| IdeError::new(ErrorKind::Protocol, e.to_string()))?;
+                let columns: Vec<ResultColumn> = match stream.columns().await.map_err(|e| IdeError::new(ErrorKind::Protocol, e.to_string()))? {
+                    Some(cols) => cols
+                        .iter()
+                        .map(|col| ResultColumn {
+                            name: col.name().to_owned(),
+                            type_name: format!("{:?}", col.column_type()),
+                        })
+                        .collect(),
+                    None => Vec::new(),
+                };
+                let mut rows: Vec<Vec<Option<String>>> = Vec::new();
+                let mut has_more = false;
+                while let Some(res) = stream.next().await {
+                    let item = res.map_err(|e| IdeError::new(ErrorKind::Protocol, e.to_string()))?;
+                    if let tiberius::QueryItem::Row(row) = item {
+                        if rows.len() >= max_rows {
+                            has_more = true;
+                            break;
+                        }
+                        let mut cells = Vec::with_capacity(row.len());
+                        for i in 0..row.len() {
+                            cells.push(tiberius_cell(&row, i));
+                        }
+                        rows.push(cells);
+                    }
+                }
+                let affected = None;
+                (columns, rows, affected, has_more, Some(started))
+            }
         };
         let (columns, rows, affected, has_more, first) = fetched;
         let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -608,6 +800,7 @@ impl Held {
 pub fn begin_statement(driver: DbDriver) -> &'static str {
     match driver {
         DbDriver::Mysql => "START TRANSACTION",
+        DbDriver::SqlServer => "BEGIN TRAN",
         DbDriver::Sqlite | DbDriver::Postgres => "BEGIN",
     }
 }

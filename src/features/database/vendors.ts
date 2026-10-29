@@ -57,6 +57,7 @@ export const VENDORS: readonly DbVendor[] = [
     icon: "db-singlestore",
     scheme: "singlestore",
   },
+  { id: "sqlServer", label: "Microsoft SQL Server", driver: "sqlServer", port: 1433, icon: "db-sqlserver", scheme: "sqlserver" },
   { id: "sqlite", label: "SQLite", driver: "sqlite", port: null, icon: "db-sqlite", scheme: "sqlite" },
   {
     id: "supabase",
@@ -113,6 +114,8 @@ const SCHEMES: Record<string, string> = {
   singlestore: "singlestore",
   memsql: "singlestore",
   oceanbase: "oceanbase",
+  sqlserver: "sqlServer",
+  mssql: "sqlServer",
 };
 
 export const vendorOfScheme = (scheme: string): DbVendor | undefined => BY_ID.get(SCHEMES[scheme.toLowerCase()] ?? "");
