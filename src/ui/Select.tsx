@@ -12,6 +12,8 @@ export interface SelectOption<V extends string = string> {
   label: string;
   icon?: IconName | (string & {});
   detail?: string;
+  /** Extra text (not shown) that the search should also match. */
+  keywords?: string;
   disabled?: boolean;
 }
 
@@ -32,6 +34,17 @@ export interface SelectProps<V extends string = string> {
 }
 
 const TYPE_AHEAD_MS = 800;
+
+/** Substring or subsequence (fuzzy) match. */
+function containsOrFuzzy(haystack: string, needle: string): boolean {
+  if (haystack.includes(needle)) return true;
+  let i = 0;
+  for (const ch of haystack) {
+    if (ch === needle[i]) i++;
+    if (i >= needle.length) return true;
+  }
+  return false;
+}
 
 /** Dropdown select with a listbox popup (↑↓ Enter Esc, type-ahead). */
 export function Select<V extends string = string>({
@@ -56,7 +69,41 @@ export function Select<V extends string = string>({
   const isSection = (o: SelectOption<V>) => !!o.disabled;
   const filtered =
     searchable && query.trim()
-      ? options.filter((o) => !o.disabled && tx(o.label).toLowerCase().includes(query.trim().toLowerCase()))
+      ? (() => {
+          const q = query.trim().toLowerCase();
+          const tokens = q.split(/\s+/).filter(Boolean);
+          const matches = (o: SelectOption<V>) => {
+            const haystack = `${tx(o.label)} ${o.detail != null ? tx(o.detail) : ""} ${o.keywords ?? ""}`.toLowerCase();
+            return tokens.every((tok) => containsOrFuzzy(haystack, tok));
+          };
+          // Keep section headers visible as long as at least one of their
+          // items matches, so the provider grouping survives filtering.
+          const out: SelectOption<V>[] = [];
+          let section: SelectOption<V> | null = null;
+          let bucket: SelectOption<V>[] = [];
+          let sectionMatched = false;
+          const flush = () => {
+            if (section && sectionMatched) {
+              out.push(section, ...bucket);
+            } else if (!section && bucket.length) {
+              out.push(...bucket);
+            }
+            section = null;
+            bucket = [];
+            sectionMatched = false;
+          };
+          for (const o of options) {
+            if (o.disabled) {
+              flush();
+              section = o;
+            } else if (matches(o)) {
+              bucket.push(o);
+              sectionMatched = true;
+            }
+          }
+          flush();
+          return out;
+        })()
       : options;
 
   const openPopup = () => {
