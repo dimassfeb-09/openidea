@@ -15,6 +15,8 @@ export interface SelectOption<V extends string = string> {
   /** Extra text (not shown) that the search should also match. */
   keywords?: string;
   disabled?: boolean;
+  /** A non-selectable group heading, independent of disabled options. */
+  section?: boolean;
 }
 
 export interface SelectProps<V extends string = string> {
@@ -62,11 +64,12 @@ export function Select<V extends string = string>({
   const tx = useTx();
   const [open, setOpen] = useState(false);
   const triggerRef = useRef<HTMLButtonElement>(null);
-  const current = options.find((o) => o.value === value);
+  const current = options.find((o) => !o.section && o.value === value);
   const [active, setActive] = useState(0);
   const [query, setQuery] = useState("");
   const typeAhead = useRef({ text: "", at: -Infinity });
-  const isSection = (o: SelectOption<V>) => !!o.disabled;
+  const isSection = (o: SelectOption<V>) => !!o.section;
+  const unavailable = (o: SelectOption<V>) => !!(o.section || o.disabled);
   const filtered =
     searchable && query.trim()
       ? (() => {
@@ -93,7 +96,7 @@ export function Select<V extends string = string>({
             sectionMatched = false;
           };
           for (const o of options) {
-            if (o.disabled) {
+            if (o.section) {
               flush();
               section = o;
             } else if (matches(o)) {
@@ -106,30 +109,35 @@ export function Select<V extends string = string>({
         })()
       : options;
 
+  const activeIndex =
+    filtered[active] && !unavailable(filtered[active]!) ? active : filtered.findIndex((o) => !unavailable(o));
+
   const openPopup = () => {
     setQuery("");
     setActive(
       Math.max(
         0,
-        options.findIndex((o) => o.value === value),
+        options.findIndex((o) => !unavailable(o) && o.value === value),
       ),
     );
     setOpen(true);
   };
 
   const choose = (o: SelectOption<V> | undefined) => {
-    if (!o || o.disabled) return;
+    if (!o || unavailable(o)) return;
     onChange(o.value);
     setOpen(false);
   };
 
   const onPopupKey = (e: KeyboardEvent) => {
-    if (e.key === "Enter" || e.key === " ") {
+    const searching = searchable && e.target instanceof HTMLInputElement;
+    if (e.key === "Enter" || (e.key === " " && !searching)) {
       e.preventDefault();
-      choose(filtered[active]);
+      choose(filtered[activeIndex]);
       return;
     }
-    const next = listNavigate(e.key, { items: options, active, isSection, wrap: true });
+    if (searching && !["ArrowDown", "ArrowUp"].includes(e.key)) return;
+    const next = listNavigate(e.key, { items: filtered, active: activeIndex, isSection: unavailable, wrap: true });
     if (next !== null) {
       e.preventDefault();
       setActive(next);
@@ -144,8 +152,8 @@ export function Select<V extends string = string>({
       const prefix = repeat ? ahead.text[0]! : ahead.text;
       const n = filtered.length;
       for (let s = prefix.length > 1 ? 0 : 1; s <= n; s++) {
-        const i = (active + s) % n;
-        if (!filtered[i]!.disabled && tx(filtered[i]!.label).toLowerCase().startsWith(prefix)) {
+        const i = (activeIndex + s) % n;
+        if (!unavailable(filtered[i]!) && tx(filtered[i]!.label).toLowerCase().startsWith(prefix)) {
           setActive(i);
           break;
         }
@@ -191,7 +199,12 @@ export function Select<V extends string = string>({
         role="presentation"
         className={styles.popup}
       >
-        <div tabIndex={-1} data-autofocus onKeyDown={onPopupKey} className={styles.popupInner}>
+        <div
+          tabIndex={-1}
+          data-autofocus={searchable ? undefined : true}
+          onKeyDown={onPopupKey}
+          className={styles.popupInner}
+        >
           {searchable && (
             <div className={styles.searchWrap}>
               <SearchField
@@ -200,7 +213,7 @@ export function Select<V extends string = string>({
                 placeholder={tx("Search…")}
                 onChange={(v) => {
                   setQuery(v);
-                  setActive(0);
+                  setActive(-1);
                 }}
                 size="normal"
                 variant="framed"
@@ -211,7 +224,7 @@ export function Select<V extends string = string>({
           {/* Virtualised rows are absolutely positioned; this sizes the popup to the widest label. */}
           <div aria-hidden className={styles.sizer}>
             {options.map((o) => (
-              <div key={o.value} className={styles.sizerRow}>
+              <div key={`${o.section ? "section" : "option"}:${o.value}`} className={styles.sizerRow}>
                 <span className={styles.check} />
                 {o.icon && <Icon name={o.icon} size={14} />}
                 <span>{tx(o.label)}</span>
@@ -221,11 +234,13 @@ export function Select<V extends string = string>({
           </div>
           <List
             items={filtered}
-            getKey={(o) => o.value}
+            getKey={(o) => `${o.section ? "section" : "option"}:${o.value}`}
             isSection={isSection}
             renderSection={(o) => <span className={styles.disabled}>{tx(o.label)}</span>}
-            activeIndex={active}
-            onActiveChange={setActive}
+            activeIndex={activeIndex}
+            onActiveChange={(i) => {
+              if (!unavailable(filtered[i]!)) setActive(i);
+            }}
             onActivate={(o) => choose(o)}
             focusable={false}
             hoverSelects
@@ -233,7 +248,10 @@ export function Select<V extends string = string>({
             aria-label={tx(aria["aria-label"])}
             className={styles.list}
             renderItem={(o) => (
-              <>
+              <span
+                className={clsx(styles.option, o.disabled && styles.disabled)}
+                aria-disabled={o.disabled || undefined}
+              >
                 <span className={styles.check}>{o.value === value && <Icon name="check" size={12} />}</span>
                 {o.icon && <Icon name={o.icon} size={14} />}
                 <span className={clsx(styles.optionLabel, o.detail && styles.withDetail)}>{tx(o.label)}</span>
@@ -242,7 +260,7 @@ export function Select<V extends string = string>({
                     {tx(o.detail)}
                   </span>
                 )}
-              </>
+              </span>
             )}
           />
         </div>
